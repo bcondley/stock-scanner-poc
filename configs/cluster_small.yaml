@@ -1,0 +1,33 @@
+tickers: "sp500"  # special value — pipeline resolves to full S&P 500 list
+
+start_date: "2024-01-01"
+end_date: "2024-12-31"
+
+indicators:
+  - name: rsi
+    params:
+      period: 14
+  - name: macd
+  - name: bollinger
+  - name: sma
+    params:
+      period: 50
+  - name: ema
+    params:
+      period: 20
+
+filters:
+  rsi_below: 30
+  macd_cross: bullish
+
+chunk_size: 100
+redis_url: "redis://localhost:6379/0"
+cache_ttl: 7200
+
+cluster:
+  provider: aws
+  node_count: 3
+  instance_type: t3.medium
+  ttl_hours: 2
+  region: us-east-1
+  placement_group: screener-pg

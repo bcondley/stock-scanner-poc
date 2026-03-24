@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: stock-screener
+Version: 0.1.0
+Summary: Distributed stock screening pipeline using Ray
+Requires-Python: >=3.10
+Requires-Dist: boto3>=1.34
+Requires-Dist: paramiko>=3.4
+Requires-Dist: ray[default]>=2.9
+Requires-Dist: redis>=5.0
+Requires-Dist: marshmallow>=3.21
+Requires-Dist: dacite>=1.8
+Requires-Dist: yfinance>=0.2.36
+Requires-Dist: pandas>=2.2
+Requires-Dist: numpy>=1.26
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: click>=8.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-xdist>=3.5; extra == "dev"
+Requires-Dist: pytest-mock>=3.12; extra == "dev"
+Requires-Dist: moto[ec2,elasticache]>=5.0; extra == "dev"
+Requires-Dist: fakeredis>=2.21; extra == "dev"

@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stock Screener Pipeline Blueprint</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0e17; }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState } = React;
+
+const COLORS = {
+  bg: "#0a0e17",
+  surface: "#111827",
+  surfaceLight: "#1a2234",
+  border: "#2a3650",
+  borderActive: "#3b82f6",
+  text: "#e2e8f0",
+  textMuted: "#8896b0",
+  accent: "#3b82f6",
+  accentGlow: "rgba(59,130,246,0.15)",
+  green: "#22c55e",
+  greenGlow: "rgba(34,197,94,0.12)",
+  orange: "#f59e0b",
+  orangeGlow: "rgba(245,158,11,0.12)",
+  purple: "#a78bfa",
+  purpleGlow: "rgba(167,139,250,0.12)",
+  red: "#ef4444",
+  redGlow: "rgba(239,68,68,0.12)",
+  cyan: "#06b6d4",
+  cyanGlow: "rgba(6,182,212,0.12)",
+  dimmed: "#4b5e7a",
+};
+
+const layers = [
+  {
+    id: "config",
+    title: "Configuration & Validation Layer",
+    subtitle: "Schema-Enforced Pipeline Configuration at the Boundary",
+    color: COLORS.green,
+    glow: COLORS.greenGlow,
+    components: [
+      { name: "Marshmallow Schemas", detail: "Validates YAML config at ingress \u2014 whitelisted indicators, date format enforcement, provider constraints, node count ranges. Rejects invalid input before any compute spins up", tech: "marshmallow 4.x, Schema + @validates" },
+      { name: "Typed Dataclasses", detail: "Frozen dataclasses (ScreenerConfig, ClusterConfig, IndicatorConfig) hydrated via dacite from validated dicts. Immutable by construction \u2014 safe for parallel execution", tech: "dacite.from_dict + @dataclass(frozen=True)" },
+      { name: "YAML Config Loader", detail: "Single entry point: load_config(path) reads YAML, validates through Marshmallow, hydrates to typed config. Config is always valid downstream", tech: "PyYAML + dacite + marshmallow pipeline" },
+    ],
+  },
+  {
+    id: "pipeline",
+    title: "Pipeline DAG Layer",
+    subtitle: "Four-Stage Screening Pipeline with Local and Distributed Execution",
+    color: COLORS.accent,
+    glow: COLORS.accentGlow,
+    components: [
+      { name: "Ingest Stage", detail: "Partitions ticker list into chunks sized for parallel workers. Static S&P 500 list (~500 tickers) avoids runtime web scraping dependency", tech: "partition_tickers() + get_sp500_tickers()" },
+      { name: "Fetch Stage", detail: "Pulls OHLCV price data per ticker via yfinance (free, no API key). Redis cache layer prevents re-fetching across indicator calculations. Cache key: ohlcv:{ticker}:{start}:{end}", tech: "yfinance + Redis cache with TTL" },
+      { name: "Compute Stage", detail: "Applies indicator chain (RSI, MACD, Bollinger, SMA, EMA) to each ticker's data. Pure functions \u2014 DataFrame in, enriched DataFrame out. Embarrassingly parallel", tech: "Indicator registry + compute_chunk()" },
+      { name: "Screen Stage", detail: "Applies configurable filter criteria (RSI thresholds, MACD crossovers, price vs SMA, Bollinger squeeze) then ranks passing tickers", tech: "FILTER_FUNCTIONS dispatch + rank_results()" },
+    ],
+  },
+  {
+    id: "compute",
+    title: "Technical Indicator Layer",
+    subtitle: "Auto-Registered Pure Functions for Price Series Analysis",
+    color: COLORS.purple,
+    glow: COLORS.purpleGlow,
+    components: [
+      { name: "Indicator Registry", detail: "Abstract base class with __init_subclass__ auto-registration. Any subclass setting a name attribute is discoverable via get_indicator(). No manual wiring required", tech: "INDICATOR_REGISTRY + __init_subclass__" },
+      { name: "RSI (Relative Strength Index)", detail: "EWM-based calculation with configurable period (default 14). Detects overbought (>70) and oversold (<30) conditions from price momentum", tech: "pandas ewm(alpha=1/period)" },
+      { name: "MACD (Moving Average Convergence Divergence)", detail: "Fast/slow EMA difference with signal line and histogram. Bullish/bearish crossover detection via histogram sign change", tech: "pandas ewm(span=N) difference" },
+      { name: "Bollinger Bands + Moving Averages", detail: "Bollinger: SMA \u00b1 N standard deviations with width metric. SMA/EMA: configurable period rolling/exponential means for trend identification", tech: "pandas rolling() + ewm()" },
+    ],
+  },
+  {
+    id: "infra",
+    title: "Infrastructure & Cluster Layer",
+    subtitle: "EC2 Provisioning, SSH Bootstrap, and Distributed Execution via Ray",
+    color: COLORS.orange,
+    glow: COLORS.orangeGlow,
+    components: [
+      { name: "AWS Provider (Boto3)", detail: "Provisions EC2 cluster with placement group (cluster strategy) for low-latency inter-node networking. Instances tagged for identification and cleanup. Waits for running state before returning", tech: "boto3 EC2 + placement groups + tagging" },
+      { name: "SSH Bootstrap (Paramiko)", detail: "SSHes into each node, installs Ray and Python dependencies, starts head node or joins workers to cluster. Retry logic handles EC2 startup delay (5 attempts, 10s intervals)", tech: "paramiko SSHClient + exec_command" },
+      { name: "Ray Distribution", detail: "Fetch and Compute stages fan out as Ray remote tasks across workers. DataFrames serialized to JSON for cross-node transfer. 500 tickers across 5 workers = ~100 each", tech: "@ray.remote + ray.get() fan-out/gather" },
+      { name: "Autoscaler", detail: "Monitors Ray cluster resource utilization (total vs available CPUs). Requests additional EC2 instances through the provider when pending work exceeds threshold", tech: "ray.cluster_resources() + boto3 scale-up" },
+      { name: "Redis State & Cache", detail: "Three roles: OHLCV data cache (avoids re-fetching), cluster node registry (IP, role, status), and pipeline result sink (final ranked output as JSON)", tech: "Redis hashes, sets, and key-value store" },
+    ],
+  },
+];
+
+const enabledCapabilities = [
+  { name: "Horizontal Scaling", detail: "Adding tickers or indicators scales linearly \u2014 autoscaler requests more EC2 workers when task queue depth grows beyond threshold" },
+  { name: "Configurable Strategies", detail: "New indicators are a single file (subclass + name). New filters are a lambda in the dispatch table. No pipeline changes needed" },
+  { name: "Local Development", detail: "Full pipeline runs locally without Ray, AWS, or Redis. Same config, same code paths, --local flag switches execution mode" },
+  { name: "Caching Layer", detail: "Redis caching means multiple indicator calculations on the same ticker don't re-fetch. Cache TTL is configurable per run" },
+];
+
+const dataFlows = [
+  {
+    label: "Local Pipeline Execution",
+    from: "CLI Command",
+    to: "Config \u2192 Ingest \u2192 Fetch \u2192 Compute \u2192 Screen \u2192 Results",
+    type: "sync",
+    steps: [
+      { text: "User runs: stock-screener run config.yaml --local", inScope: false },
+      { text: "YAML loaded, validated by Marshmallow, hydrated to ScreenerConfig via dacite", inScope: true },
+      { text: "Ticker list partitioned into chunks based on chunk_size config", inScope: true },
+      { text: "Each chunk fetched via yfinance, cached in Redis if available", inScope: true },
+      { text: "Indicator chain applied to each ticker's OHLCV DataFrame", inScope: true },
+      { text: "Filter criteria applied, passing tickers ranked by configured metric", inScope: true },
+      { text: "Results written to JSON file or stdout", inScope: false },
+    ],
+    note: "Local mode runs the full DAG in a single process. No Ray, no EC2, no Redis required. Ideal for development and small ticker lists.",
+  },
+  {
+    label: "Distributed Pipeline Execution",
+    from: "CLI Command",
+    to: "Config \u2192 Ray Init \u2192 Fan-Out Fetch \u2192 Fan-Out Compute \u2192 Gather \u2192 Screen",
+    type: "async",
+    steps: [
+      { text: "User runs: stock-screener run config.yaml", inScope: false },
+      { text: "Config validated, Ray initialized (connects to existing cluster or starts local)", inScope: true },
+      { text: "Tickers partitioned into chunks, each submitted as a Ray remote fetch task", inScope: true },
+      { text: "Ray workers pull OHLCV data in parallel, caching to Redis", inScope: true },
+      { text: "Fetched chunks submitted as Ray remote compute tasks for indicator calculation", inScope: true },
+      { text: "ray.get() gathers all computed chunks, DataFrames deserialized from JSON", inScope: true },
+      { text: "Filter and rank executed on the head node, results returned", inScope: true },
+      { text: "Results written to JSON file", inScope: false },
+    ],
+    note: "Stages 2 (fetch) and 3 (compute) are embarrassingly parallel. Each Ray worker handles ~100 tickers when running 500 across 5 nodes.",
+  },
+  {
+    label: "Cluster Provisioning Flow",
+    from: "CLI Provision Command",
+    to: "Boto3 \u2192 EC2 Launch \u2192 SSH Bootstrap \u2192 Ray Cluster Ready",
+    type: "bridge",
+    steps: [
+      { text: "User runs: stock-screener provision config.yaml --key-path ~/.ssh/key.pem", inScope: false },
+      { text: "Placement group created with cluster strategy for low-latency networking", inScope: true },
+      { text: "EC2 instances launched with screener-cluster tag, waiter blocks until running", inScope: true },
+      { text: "Paramiko SSHes into first node, installs deps, starts ray --head", inScope: true },
+      { text: "Remaining nodes bootstrapped: install deps, ray start --address={head_ip}", inScope: true },
+      { text: "All nodes registered in Redis state (instance_id, IP, role)", inScope: true },
+      { text: "Cluster ready for distributed pipeline execution", inScope: false },
+    ],
+    note: "SSH retry logic handles the gap between EC2 'running' state and SSH readiness. Head node's private IP is used for intra-cluster Ray communication.",
+  },
+  {
+    label: "Autoscaling Response",
+    from: "Autoscaler Check",
+    to: "Ray Metrics \u2192 Capacity Decision \u2192 Boto3 Scale-Up \u2192 Bootstrap Join",
+    type: "query",
+    steps: [
+      { text: "Autoscaler invoked (manually or between pipeline stages)", inScope: false },
+      { text: "Queries ray.cluster_resources() and ray.available_resources() for CPU utilization", inScope: true },
+      { text: "Computes desired node count: max(current, pending_tasks / tasks_per_node + 1)", inScope: true },
+      { text: "If scale-up needed, calls provider.launch_nodes() for additional EC2 instances", inScope: true },
+      { text: "New nodes bootstrapped via Paramiko: install deps, join Ray cluster", inScope: true },
+      { text: "New workers immediately available for pending and future Ray tasks", inScope: false },
+    ],
+    note: "Autoscaler is threshold-based and called on-demand. It does not run as a background polling loop. Max nodes capped to prevent runaway scaling.",
+  },
+  {
+    label: "Error Handling & Resilience",
+    from: "Fetch or Compute Failure",
+    to: "Per-Ticker Isolation \u2192 Log \u2192 Continue Pipeline",
+    type: "error",
+    steps: [
+      { text: "Network error or API failure during yfinance fetch for a single ticker", inScope: false },
+      { text: "fetch_ticker_data catches exception, logs with ticker context, returns None", inScope: true },
+      { text: "fetch_chunk skips None results \u2014 other tickers in the chunk continue", inScope: true },
+      { text: "compute_indicators catches per-indicator failures, logs and continues chain", inScope: true },
+      { text: "Screen stage operates on whatever data made it through \u2014 partial results are valid", inScope: true },
+      { text: "User sees results for all tickers that succeeded", inScope: false },
+    ],
+    note: "Failures are isolated per-ticker and per-indicator. A single bad ticker doesn't take down the pipeline. Missing data means that ticker is excluded from screening results.",
+  },
+];
+
+const decisions = [
+  {
+    title: "Ray Over Celery/Dask for Distribution",
+    decision: "Ray remote tasks for parallel fetch and compute stages. DataFrames serialized to JSON (orient='split') for cross-node transfer rather than relying on Ray's object store for large DataFrames.",
+    rationale: "Ray's task model maps directly to the fan-out/gather pattern needed for both fetch and compute stages. The autoscaler can query Ray's resource metrics to drive EC2 scaling decisions. Ray also handles worker failure and task retry natively.",
+    tradeoff: "Ray requires Python 3.12 or below (no 3.13/3.14 support yet). JSON serialization is slower than Arrow/pickle but avoids version-mismatch deserialization errors across heterogeneous nodes. For 500 tickers this overhead is negligible.",
+  },
+  {
+    title: "Static S&P 500 List Over Runtime Scraping",
+    decision: "Ticker list is a static Python list in ingest.py (~500 tickers). No Wikipedia scraping, no external API dependency for the ticker universe.",
+    rationale: "Removes a fragile runtime dependency. Wikipedia table structures change, rate limits apply, and the scrape adds latency to pipeline startup. S&P 500 composition changes quarterly \u2014 a static list updated periodically is sufficient for a screening POC.",
+    tradeoff: "List goes stale as companies are added/removed from the index. Acceptable for POC scope. Production would pull from a data vendor or maintain a versioned ticker file.",
+  },
+  {
+    title: "Indicator Registry via __init_subclass__",
+    decision: "All indicators auto-register by inheriting from the Indicator base class and setting a name class attribute. No manual registration, no decorator, no import-time side effects beyond normal module loading.",
+    rationale: "Adding a new indicator is: create a file, subclass Indicator, set name, implement compute(). Zero changes to existing code. The registry pattern keeps the indicator→pipeline coupling at exactly one point (the config's indicator name string).",
+    tradeoff: "All indicator modules must be imported for registration to occur. The __init__.py handles this, but forgetting an import means the indicator silently doesn't exist. Mitigated by the config validator rejecting unknown indicator names at load time.",
+  },
+  {
+    title: "Frozen Dataclasses for Pipeline Config",
+    decision: "All config dataclasses are frozen=True. Config is immutable after hydration. No mutation allowed during pipeline execution.",
+    rationale: "Distributed execution means config flows to multiple workers. Mutation would create divergent state. Frozen dataclasses make this impossible by construction and fail loudly (AttributeError) if code attempts mutation.",
+    tradeoff: "Config transformations (e.g., overriding a field for a specific stage) require creating a new dataclass instance via dataclasses.replace(). Slightly more verbose than mutation but prevents a class of distributed bugs.",
+  },
+  {
+    title: "Redis for Cache, State, and Results",
+    decision: "Single Redis instance serves three roles: OHLCV data cache (avoid re-fetching), cluster node registry (track provisioned instances), and pipeline result sink (store final output).",
+    rationale: "Redis is already required for Ray's internal coordination in cluster mode. Using it for application-level caching and state avoids introducing another dependency. All three use cases are key-value shaped and benefit from Redis's sub-millisecond reads.",
+    tradeoff: "Single point of failure if Redis goes down mid-pipeline. Mitigated by graceful fallback: the pipeline runs without cache (re-fetches data), and results can be written directly to JSON. Cluster state loss is recoverable by re-querying EC2 tags.",
+  },
+  {
+    title: "Marshmallow Validation Before Compute",
+    decision: "All pipeline configuration is validated through Marshmallow schemas before any compute, network calls, or cluster provisioning begins. Invalid configs fail fast with structured error messages.",
+    rationale: "Provisioning EC2 instances takes minutes and costs money. Fetching 500 tickers takes time. Validating that the config is well-formed before any of that happens prevents wasted resources on configs that would fail mid-pipeline.",
+    tradeoff: "Schema must be kept in sync with the dataclass definitions. Marshmallow 4.x API changes (e.g., @validates accepting data_key kwarg) require attention during upgrades. Dual schema+dataclass is more code than a single Pydantic model, but keeps validation and domain models decoupled.",
+  },
+  {
+    title: "Local and Distributed Execution from Same Config",
+    decision: "ScreeningPipeline has two code paths (_run_local and _run_distributed) selected by a single flag. Same config file drives both modes. No separate config format for local vs cluster.",
+    rationale: "Developers iterate locally with --local flag, then run the same config on a cluster. No config translation step, no environment-specific files. Reduces the gap between development and production execution.",
+    tradeoff: "Cluster config fields (node_count, instance_type, placement_group) are present but ignored in local mode. Slightly noisy but preferable to maintaining two config schemas or conditional field requirements.",
+  },
+];
+
+function ComponentCard({ comp, color, glow }) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        background: hovered ? COLORS.surfaceLight : COLORS.surface,
+        border: `1px solid ${hovered ? color : COLORS.border}`,
+        borderRadius: 8,
+        padding: "14px 16px",
+        cursor: "default",
+        transition: "all 0.2s ease",
+        boxShadow: hovered ? `0 0 20px ${glow}` : "none",
+        flex: "1 1 220px",
+        minWidth: 220,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+        <div style={{ width: 8, height: 8, borderRadius: "50%", background: color, boxShadow: `0 0 6px ${color}` }} />
+        <span style={{ fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: 13, fontWeight: 600, color: COLORS.text }}>{comp.name}</span>
+      </div>
+      <p style={{ fontSize: 12, color: COLORS.textMuted, margin: "0 0 8px 0", lineHeight: 1.5 }}>{comp.detail}</p>
+      <div style={{
+        fontSize: 11,
+        color: color,
+        background: glow,
+        padding: "4px 8px",
+        borderRadius: 4,
+        display: "inline-block",
+        fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+      }}>
+        {comp.tech}
+      </div>
+    </div>
+  );
+}
+
+function LayerRow({ layer, isActive, onClick }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        background: isActive ? COLORS.surfaceLight : COLORS.surface,
+        border: `1px solid ${isActive ? layer.color : COLORS.border}`,
+        borderRadius: 12,
+        padding: "20px 24px",
+        cursor: "pointer",
+        transition: "all 0.25s ease",
+        boxShadow: isActive ? `0 0 30px ${layer.glow}, inset 0 0 30px ${layer.glow}` : "none",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: isActive ? 16 : 0 }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 12, height: 3, background: layer.color, borderRadius: 2, boxShadow: `0 0 8px ${layer.color}` }} />
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: COLORS.text, fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
+              {layer.title}
+            </h3>
+          </div>
+          <p style={{ margin: "4px 0 0 22px", fontSize: 12, color: COLORS.textMuted }}>{layer.subtitle}</p>
+        </div>
+        <span style={{ color: COLORS.textMuted, fontSize: 18, transform: isActive ? "rotate(180deg)" : "rotate(0)", transition: "transform 0.2s" }}>{"\u25BE"}</span>
+      </div>
+      {isActive && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8 }}>
+          {layer.components.map((c, i) => (
+            <ComponentCard key={i} comp={c} color={layer.color} glow={layer.glow} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FlowTypeIcon({ type }) {
+  const icons = { sync: "\u2192", async: "\u21e2", error: "\u26a1", bridge: "\u21c4", query: "\u2315" };
+  const colors = { sync: COLORS.accent, async: COLORS.purple, error: COLORS.red, bridge: COLORS.cyan, query: COLORS.green };
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", justifyContent: "center",
+      width: 28, height: 28, borderRadius: 6,
+      background: `${colors[type]}22`, color: colors[type],
+      fontWeight: 700, fontSize: 16, fontFamily: "monospace",
+    }}>
+      {icons[type]}
+    </span>
+  );
+}
+
+function FlowStep({ step, isLast }) {
+  return (
+    <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+      <div style={{
+        display: "flex", flexDirection: "column", alignItems: "center", minWidth: 18, paddingTop: 2,
+      }}>
+        <div style={{
+          width: 8, height: 8, borderRadius: "50%",
+          background: step.inScope ? COLORS.accent : COLORS.dimmed,
+          boxShadow: step.inScope ? `0 0 6px ${COLORS.accent}` : "none",
+          flexShrink: 0,
+        }} />
+        {!isLast && <div style={{ width: 1, height: 20, background: COLORS.border, marginTop: 4 }} />}
+      </div>
+      <span style={{
+        fontSize: 12,
+        lineHeight: 1.5,
+        color: step.inScope ? COLORS.text : COLORS.dimmed,
+        fontStyle: step.inScope ? "normal" : "italic",
+        fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+      }}>
+        {step.text}
+      </span>
+    </div>
+  );
+}
+
+function ScreenerBlueprint() {
+  const [activeLayer, setActiveLayer] = useState("config");
+  const [activeTab, setActiveTab] = useState("architecture");
+  const [capsExpanded, setCapsExpanded] = useState(false);
+
+  return (
+    <div style={{
+      background: COLORS.bg,
+      minHeight: "100vh",
+      color: COLORS.text,
+      fontFamily: "'Inter', -apple-system, sans-serif",
+      padding: "32px 24px",
+    }}>
+      <div style={{ maxWidth: 960, margin: "0 auto" }}>
+        {/* Header */}
+        <div style={{ marginBottom: 32, borderBottom: `1px solid ${COLORS.border}`, paddingBottom: 24 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+            <div style={{ width: 4, height: 32, background: `linear-gradient(180deg, ${COLORS.accent}, ${COLORS.purple})`, borderRadius: 2 }} />
+            <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "-0.02em" }}>
+              Stock Screener Pipeline Blueprint
+            </h1>
+          </div>
+          <p style={{ margin: "0 0 0 16px", color: COLORS.textMuted, fontSize: 13, lineHeight: 1.6 }}>
+            Distributed stock screening pipeline &mdash; multi-stage DAG across an EC2 cluster via Ray, screening ~500 S&P 500 tickers through configurable technical indicator analysis
+          </p>
+          <div style={{ display: "flex", gap: 12, marginTop: 12, marginLeft: 16, flexWrap: "wrap" }}>
+            {["Ray", "Boto3", "Paramiko", "Redis", "Marshmallow", "dacite", "yfinance", "pandas"].map(tag => (
+              <span key={tag} style={{
+                fontSize: 11, color: COLORS.textMuted, background: COLORS.surfaceLight,
+                padding: "3px 10px", borderRadius: 4, border: `1px solid ${COLORS.border}`,
+                fontFamily: "'JetBrains Mono', monospace",
+              }}>{tag}</span>
+            ))}
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div style={{ display: "flex", gap: 4, marginBottom: 24, background: COLORS.surface, borderRadius: 8, padding: 4, border: `1px solid ${COLORS.border}` }}>
+          {[
+            { id: "architecture", label: "Layered Architecture" },
+            { id: "dataflows", label: "Pipeline Flow Patterns" },
+            { id: "decisions", label: "Key Design Decisions" },
+          ].map(tab => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                flex: 1,
+                padding: "10px 16px",
+                background: activeTab === tab.id ? COLORS.surfaceLight : "transparent",
+                border: activeTab === tab.id ? `1px solid ${COLORS.borderActive}` : "1px solid transparent",
+                borderRadius: 6,
+                color: activeTab === tab.id ? COLORS.text : COLORS.textMuted,
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: "pointer",
+                transition: "all 0.2s",
+                fontFamily: "'JetBrains Mono', monospace",
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Architecture Tab */}
+        {activeTab === "architecture" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <p style={{ fontSize: 12, color: COLORS.textMuted, margin: "0 0 8px 0" }}>
+              Click each layer to expand components. Config validates before compute. Pipeline stages fan out via Ray. Infrastructure provisions and scales the cluster.
+            </p>
+            {layers.map((layer) => (
+              <div key={layer.id}>
+                <LayerRow
+                  layer={layer}
+                  isActive={activeLayer === layer.id}
+                  onClick={() => setActiveLayer(activeLayer === layer.id ? null : layer.id)}
+                />
+                {layer.id !== "infra" && (
+                  <div style={{ display: "flex", justifyContent: "center", padding: "4px 0" }}>
+                    <div style={{ width: 1, height: 16, background: COLORS.border }} />
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {/* Enabled Capabilities */}
+            <div style={{ display: "flex", justifyContent: "center", padding: "4px 0" }}>
+              <div style={{ width: 1, height: 16, background: COLORS.border, opacity: 0.4 }} />
+            </div>
+            <div
+              onClick={() => setCapsExpanded(!capsExpanded)}
+              style={{
+                background: capsExpanded ? COLORS.surfaceLight : COLORS.surface,
+                border: `1px dashed ${capsExpanded ? COLORS.dimmed : COLORS.border}`,
+                borderRadius: 12,
+                padding: "20px 24px",
+                cursor: "pointer",
+                transition: "all 0.25s ease",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: capsExpanded ? 16 : 0 }}>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <div style={{ width: 12, height: 3, background: COLORS.dimmed, borderRadius: 2 }} />
+                    <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: COLORS.dimmed, fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
+                      Enabled Capabilities
+                    </h3>
+                    <span style={{
+                      fontSize: 10, color: COLORS.dimmed, fontStyle: "italic",
+                      background: `${COLORS.dimmed}18`, padding: "2px 8px", borderRadius: 4,
+                      border: `1px solid ${COLORS.dimmed}30`,
+                    }}>what this architecture enables</span>
+                  </div>
+                  <p style={{ margin: "4px 0 0 22px", fontSize: 12, color: COLORS.dimmed }}>
+                    Scaling, extensibility, and development workflow properties that emerge from the design
+                  </p>
+                </div>
+                <span style={{ color: COLORS.dimmed, fontSize: 18, transform: capsExpanded ? "rotate(180deg)" : "rotate(0)", transition: "transform 0.2s" }}>{"\u25BE"}</span>
+              </div>
+              {capsExpanded && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+                  {enabledCapabilities.map((cap, i) => (
+                    <div key={i} style={{
+                      background: COLORS.bg,
+                      border: `1px dashed ${COLORS.border}`,
+                      borderRadius: 8,
+                      padding: "14px 16px",
+                      flex: "1 1 220px",
+                      minWidth: 220,
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.dimmed }} />
+                        <span style={{ fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: 13, fontWeight: 600, color: COLORS.dimmed }}>{cap.name}</span>
+                      </div>
+                      <p style={{ fontSize: 12, color: COLORS.dimmed, margin: 0, lineHeight: 1.5 }}>{cap.detail}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Data Flows Tab */}
+        {activeTab === "dataflows" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <p style={{ fontSize: 12, color: COLORS.textMuted, margin: "0 0 4px 0" }}>
+              How data moves through the pipeline &mdash; each pattern shows where the screener is active and where external systems take over.
+            </p>
+            <div style={{ display: "flex", gap: 16, fontSize: 11, color: COLORS.textMuted, marginBottom: 4 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.accent, boxShadow: `0 0 6px ${COLORS.accent}`, display: "inline-block" }} />
+                Within pipeline scope
+              </span>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.dimmed, display: "inline-block" }} />
+                External (user action or downstream)
+              </span>
+            </div>
+            {dataFlows.map((flow, i) => (
+              <div key={i} style={{
+                background: COLORS.surface,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 10,
+                padding: "18px 20px",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
+                  <FlowTypeIcon type={flow.type} />
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>{flow.label}</div>
+                    <div style={{ fontSize: 12, color: COLORS.textMuted }}>
+                      {flow.from} <span style={{ color: COLORS.accent }}>{"\u2192"}</span> {flow.to}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ marginLeft: 4, marginBottom: 12 }}>
+                  {flow.steps.map((step, j) => (
+                    <FlowStep key={j} step={step} isLast={j === flow.steps.length - 1} />
+                  ))}
+                </div>
+                <div style={{
+                  background: COLORS.surfaceLight,
+                  borderRadius: 6,
+                  padding: "10px 14px",
+                  fontSize: 12,
+                  color: COLORS.textMuted,
+                  lineHeight: 1.6,
+                  borderLeft: `3px solid ${COLORS.border}`,
+                }}>
+                  {flow.note}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Design Decisions Tab */}
+        {activeTab === "decisions" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <p style={{ fontSize: 12, color: COLORS.textMuted, margin: 0 }}>
+              Architectural decisions with rationale and explicit tradeoffs &mdash; the "why" behind the pipeline design.
+            </p>
+            {decisions.map((d, i) => (
+              <div key={i} style={{
+                background: COLORS.surface,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 10,
+                padding: "20px",
+              }}>
+                <h4 style={{ margin: "0 0 12px 0", fontSize: 14, fontWeight: 700, color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                  {d.title}
+                </h4>
+                {[
+                  { label: "Decision", value: d.decision, color: COLORS.green },
+                  { label: "Rationale", value: d.rationale, color: COLORS.accent },
+                  { label: "Tradeoff", value: d.tradeoff, color: COLORS.orange },
+                ].map((section, j) => (
+                  <div key={j} style={{ marginBottom: j < 2 ? 10 : 0 }}>
+                    <div style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      color: section.color,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.05em",
+                      marginBottom: 4,
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}>
+                      {section.label}
+                    </div>
+                    <p style={{ margin: 0, fontSize: 13, color: COLORS.textMuted, lineHeight: 1.6 }}>
+                      {section.value}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Footer */}
+        <div style={{ marginTop: 32, paddingTop: 16, borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 11, color: COLORS.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+            Internal Engineering Reference &middot; v0.1.0
+          </span>
+          <span style={{ fontSize: 11, color: COLORS.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+            Stock Screener POC &middot; March 2026
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<ScreenerBlueprint />);
+</script>
+</body>
+</html>

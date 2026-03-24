@@ -1,0 +1,49 @@
+tickers:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - META
+  - NVDA
+  - TSLA
+  - JPM
+  - V
+  - JNJ
+  - WMT
+  - PG
+  - UNH
+  - HD
+  - MA
+  - DIS
+  - PYPL
+  - BAC
+  - ADBE
+  - CRM
+
+start_date: "2024-01-01"
+end_date: "2024-12-31"
+
+indicators:
+  - name: rsi
+    params:
+      period: 14
+  - name: macd
+    params:
+      fast: 12
+      slow: 26
+      signal: 9
+  - name: bollinger
+    params:
+      period: 20
+      num_std: 2.0
+  - name: sma
+    params:
+      period: 50
+
+filters:
+  rsi_below: 70
+  price_above_sma: 50
+
+chunk_size: 10
+redis_url: "redis://localhost:6379/0"
+cache_ttl: 3600
